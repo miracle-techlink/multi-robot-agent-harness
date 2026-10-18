@@ -24,3 +24,9 @@
 - `rt_occupancy.png`: 包含 free/occupied/unknown 的 2D 栅格地图
 - `rt_topology.json`: 轨迹拓扑节点
 - `rt_landmarks.npz`: ORB 视觉地标描述子
+
+## 📂 运行方法
+1. 确保 ROS 2 环境已 source，且底层相机与 TOF 节点已启动。
+2. 运行主程序：
+```bash
+python3 /robot/persist/t1_project/rt_final.py
