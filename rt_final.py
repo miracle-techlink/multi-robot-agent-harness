@@ -64,17 +64,17 @@ class RealtimeFinal(Node):
         self.start_time = time.time()
         
         self.last_valid_pos = None 
-        self.world_offset = np.zeros(3) # 用于重置时保持坐标连续性
-        self.hard_limit = 0.35  # 超过 0.35m 视为跳变
-        self.consecutive_soft_limit = 0
-
+        self.world_offset = np.zeros(3)
+        self.hard_limit = 0.35  
+        
         self.last_topo_pos = None
         self.topology_nodes = []
         self.landmarks = []
         self.dropped_frames = 0
 
-        # Odom 缓存
-        self.latest_odom_2d = None
+        # Odom 缓存与锚点
+        self.latest_odom_3d = None
+        self.last_odom_3d = None
 
         # 4. 订阅
         self.sub_l = self.create_subscription(Image, '/aima/hal/camera/head_stereo_left_mono', self.left_cb, 10)
@@ -84,12 +84,11 @@ class RealtimeFinal(Node):
         qos_best_effort = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, history=HistoryPolicy.KEEP_LAST, depth=10)
         self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_cb, qos_best_effort)
 
-        self.get_logger().info("视觉 + Odom + TOF 终极融合版已启动！")
+        self.get_logger().info("终极融合版(视觉+Odom辅助)已启动！")
 
     def odom_cb(self, msg):
-        # 简单提取 X, Y 平面坐标（具体视 T1 坐标系而定，这里用作避障参考）
         p = msg.pose.pose.position
-        self.latest_odom_2d = np.array([p.x, p.y])
+        self.latest_odom_3d = np.array([p.x, p.y, p.z])
 
     def tof_cb(self, msg):
         self.latest_tof_pts = point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=True)
@@ -101,16 +100,6 @@ class RealtimeFinal(Node):
     def right_cb(self, msg):
         self.last_r = msg
         self.process()
-
-    def reset_tracker(self):
-        # 重置追踪器，但保留世界偏移
-        if self.last_valid_pos is not None:
-            self.world_offset = self.last_valid_pos.copy()
-            self.get_logger().error(f"🚨 视觉跳变，重建 Tracker，世界坐标保持于 {self.world_offset}")
-        else:
-            self.world_offset = np.zeros(3)
-        self.tracker = cuvslam.Tracker(self.rig, self.cfg)
-        self.consecutive_soft_limit = 0
 
     def process(self):
         if self.last_l is None or self.last_r is None:
@@ -138,40 +127,54 @@ class RealtimeFinal(Node):
             pose_est, _ = self.tracker.track(timestamp_ns, [l_np, r_np])
         except Exception as e:
             self.get_logger().error(f"Tracker error: {e}")
-            self.reset_tracker()
+            self.tracker = cuvslam.Tracker(self.rig, self.cfg)
             return
 
         T_wc = get_world_pose(pose_est)
         if T_wc is None:
             return
 
-        # 获取相对坐标，并加上世界偏移
         current_pos = T_wc[:3, 3] + self.world_offset
 
-        # 防漂移逻辑
+        # 🌟 Odom 辅助的防漂移跳变裁决
         if self.last_valid_pos is not None:
             jump_dist = np.linalg.norm(current_pos - self.last_valid_pos)
             
             if jump_dist > self.hard_limit:
-                self.reset_tracker()
+                self.get_logger().error(f"🚨 视觉跳变({jump_dist:.2f}m)，启动 Odom 裁决！")
+                
+                # 计算 Odom 在这段时间的实际位移增量
+                odom_moved = np.zeros(3)
+                if self.latest_odom_3d is not None and self.last_odom_3d is not None:
+                    odom_moved = self.latest_odom_3d - self.last_odom_3d
+                
+                # 如果视觉飞了 1 米，但 Odom 只动了 5 厘米，说明视觉假飞（比如起立）。
+                # 此时强制用 Odom 的位移作为世界坐标的增量。
+                if np.linalg.norm(odom_moved) < 0.1:
+                    self.get_logger().warn(f"  -> 假飞判定(Odom仅动{np.linalg.norm(odom_moved):.2f}m)，强制修正坐标")
+                    self.world_offset = self.last_valid_pos + odom_moved - T_wc[:3, 3]
+                else:
+                    self.get_logger().warn(f"  -> 真实移动(Odom移动{np.linalg.norm(odom_moved):.2f}m)，接受新坐标")
+                    self.world_offset = self.last_valid_pos + odom_moved - T_wc[:3, 3]
+                
+                self.tracker = cuvslam.Tracker(self.rig, self.cfg)
+                self.last_valid_pos = None
+                
+                # 更新 Odom 基线
+                if self.latest_odom_3d is not None:
+                    self.last_odom_3d = self.latest_odom_3d.copy()
                 return 
                 
-            elif jump_dist > 0.1: # 轻微跳变（限幅）
-                self.consecutive_soft_limit += 1
-                if self.consecutive_soft_limit >= 5:
-                    self.reset_tracker()
-                    return
-                
-                diff = current_pos - self.last_valid_pos
-                direction = diff / jump_dist
-                corrected_pos = self.last_valid_pos + direction * 0.1
-                T_wc[:3, 3] = corrected_pos - self.world_offset # 回写内部
-                current_pos = corrected_pos
-            else:
-                self.consecutive_soft_limit = 0
-
         self.last_valid_pos = current_pos.copy()
         T_wc[:3, 3] = current_pos
+
+        # 定期更新 Odom 基线（只在视觉正常时更新）
+        if self.latest_odom_3d is not None:
+            if self.last_odom_3d is None:
+                self.last_odom_3d = self.latest_odom_3d.copy()
+            else:
+                # 低频更新基线，用于捕捉突发的真实移动
+                self.last_odom_3d = self.latest_odom_3d.copy()
 
         # 拓扑与 ORB
         if self.last_topo_pos is None or np.linalg.norm(current_pos - self.last_topo_pos) > 0.5:
@@ -184,10 +187,9 @@ class RealtimeFinal(Node):
                 for i, k in enumerate(kp):
                     self.landmarks.append({"node_id": node["id"], "u": float(k.pt[0]), "v": float(k.pt[1]), "descriptor": des[i].tolist()})
 
-        # 2D 栅格建图 (使用 TOF 数据)
+        # 2D 栅格建图
         if self.latest_tof_pts is not None and self.frame_count % 2 == 0:
             pts_cam = self.latest_tof_pts
-            # 这里假设 TOF 点云在相机系下，直接使用 T_wc 投影
             valid_mask = (pts_cam[:, 2] > 0.2) & (pts_cam[:, 2] < 5.0)
             valid_pts = pts_cam[valid_mask]
             
@@ -212,7 +214,7 @@ class RealtimeFinal(Node):
         if self.frame_count % 10 == 0:
             fps = self.frame_count / (time.time() - self.start_time)
             t = current_pos
-            self.get_logger().info(f"F{self.frame_count} | FPS:{fps:.1f} | Pos:[{t[0]:.2f},{t[1]:.2f},{t[2]:.2f}] | 拓扑:{len(self.topology_nodes)} | 丢帧:{self.dropped_frames}")
+            self.get_logger().info(f"F{self.frame_count} | FPS:{fps:.1f} | Pos:[{t[0]:.2f},{t[1]:.2f},{t[2]:.2f}] | 拓扑:{len(self.topology_nodes)}")
 
 def main(args=None):
     rclpy.init(args=args)
