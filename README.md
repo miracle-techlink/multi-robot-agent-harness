@@ -1,4 +1,5 @@
 # multi-robot-agent-harness
+
 # T1 Pro 端侧视觉建图全栈系统 (cuVSLAM + TOF Occupancy)
 
 本仓库实现了在 NVIDIA Jetson Orin Nano (8GB) 上运行的本地视觉建图系统。系统仅依赖纯双目视觉和 TOF 点云，无需云端，即可在端侧实时完成位姿估计、2D Occupancy 栅格建图、拓扑图构建以及 ORB 视觉地标提取，并**以标准 ROS 2 消息对外发布，可直接接入 Nav2 导航系统**。
@@ -52,7 +53,7 @@ bash
 
 打开 Foxglove 连接 ws://127.0.0.1:9090，在 3D 面板添加 Map 图层，绑定 /rt_occupancy_grid，将 Fixed Frame 设为 map 即可查看实时建图。
 
-📂 离线输出产物 (运行 rt_final.py)
+## 📂 离线输出产物 (运行 rt_final.py)
 若通过修改代码或运行早期版本脚本，按 Ctrl+C 退出后，会在本地保存以下产物文件：
 
 rt_occupancy.png: 包含 free/occupied/unknown 的 2D 栅格地图
@@ -61,9 +62,9 @@ rt_topology.json: 轨迹拓扑节点记录
 
 rt_landmarks.npz: ORB 视觉地标描述子
 
-🔮 后续优化方向 (Roadmap)
+## 🔮 后续优化方向 (Roadmap)
 修复底层硬同步：建议联系硬件/驱动团队修复双目 100ms 错帧，恢复硬件触发，可成倍提升建图精度。
 
-Odom 紧耦合：研究 cuVSLAM 的 External Odometry 接口，将底盘 Odom 作为底层输入，彻底解决长距离漂移问题。
+## Odom 紧耦合：研究 cuVSLAM 的 External Odometry 接口，将底盘 Odom 作为底层输入，彻底解决长距离漂移问题。
 
 ROS 2 规范化封装：将单文件 Python 脚本拆分为标准的 ROS 2 Package（包含 setup.py, config, launch），并实现 systemd 开机自启。
